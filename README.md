@@ -189,6 +189,16 @@ When a task declares targets like `["src/auth/**", "src/middleware.ts"]`, the pl
 - Node.js (for the plugin runtime)
 - Git (for isolated worktree mode)
 
+## Custom Development
+
+Need a custom plugin for **OpenCode**, **Claude Code**, **OpenAI Codex**, or a purpose-built **MCP server** for your workflow? I build and integrate AI tooling, automation, and developer infrastructure for teams and businesses.
+
+**[Book a strategy session](https://calendly.com/alex-everydayworkflows/strategy-session)** or reach out at [alex@everydayworkflows.com](mailto:alex@everydayworkflows.com).
+
+<p align="center">
+  <a href="https://everydayworkflows.com">everydayworkflows.com</a>
+</p>
+
 ## License
 
 [MIT](LICENSE) — Alex De Gracia
