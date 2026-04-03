@@ -27,6 +27,7 @@
 - **Target-based overlap detection** — Declare file targets per task so the plugin can detect and prevent conflicting edits.
 - **Isolated git worktrees** — Automatically spin up dedicated worktrees for tasks that would otherwise conflict, with patch-based reconciliation when they complete.
 - **Child session guardrails** — Child sessions cannot re-delegate, preventing runaway task trees.
+- **Parent-session question relay** — If a child session blocks on a question, the plugin posts it back to the parent session and lets you answer without opening the child session.
 - **Logical task IDs** — Assign human-readable IDs to tasks for easy reuse and reconciliation.
 - **Completion callbacks** — Results are automatically queued back into the parent session when a background task finishes.
 - **Non-git workspace support** — Works in non-git directories with explicit target-based concurrency control.
@@ -53,9 +54,15 @@ git clone https://github.com/AutomatorAlex/opencode-background-tasks.git
 cp opencode-background-tasks/task.js ~/.config/opencode/plugins/task.js
 ```
 
+If you want to validate or iterate on the plugin from this repo directly, install the development dependency first:
+
+```bash
+npm install
+```
+
 ## Usage
 
-Once installed, three new tools become available in every OpenCode session:
+Once installed, five new tools become available in every OpenCode session:
 
 ### Delegate a task
 
@@ -92,6 +99,22 @@ bg_task(
 
 If `auth_refactor` was used before, the existing session is reused. Otherwise a new session is created and mapped to that ID.
 
+### Answer a child-session question from the parent
+
+If a background task asks a question, the plugin posts a notice back into the parent session. You can inspect pending items and reply without opening the child session:
+
+```
+bg_task_question_list()
+
+bg_task_question_reply(
+  request_id: "question_abc123",
+  action: "reply",
+  answers: ["Option A"]
+)
+```
+
+For multi-question or multi-select prompts, provide one answer entry per question in order. Each entry can be either a single string or an array of strings.
+
 ## Tools
 
 ### `bg_task`
@@ -125,6 +148,33 @@ Inspect or apply patches from isolated background tasks.
 - **apply** — Apply the recorded patch to the main workspace via `git apply --3way`
 - **cleanup** — Remove the worktree and branch, retaining the patch artifact
 
+### `bg_task_question_list`
+
+List pending background-task questions from child sessions.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `all` | boolean | no | Set `true` to list questions across all parent sessions instead of only the current one |
+
+By default this is scoped to the current parent session.
+
+### `bg_task_question_reply`
+
+Reply to or reject a pending child-session question from the parent session.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `request_id` | string | no | Pending question request ID from `bg_task_question_list` |
+| `task_id` | string | no | Logical task ID or child session ID. Use instead of `request_id` when only one question is pending for that task |
+| `action` | `"reply"` \| `"reject"` | yes | Whether to send answers back to the child session or reject the pending question |
+| `answers` | `(string \| string[])[]` | no | One answer entry per question, in order. Each entry can be a single string or an array of strings for multi-select prompts |
+
+Notes:
+
+- Provide either `request_id` or `task_id`
+- `task_id` lookup is scoped to the same parent session that launched the task
+- If multiple pending questions exist for the same task, use `request_id`
+
 ## Configuration
 
 ### Agent discovery
@@ -157,6 +207,11 @@ To avoid that conflict, this plugin now exports distinct tool names:
 - `bg_task_list`
 - `bg_task_reconcile`
 
+Recent versions also expose:
+
+- `bg_task_question_list`
+- `bg_task_question_reply`
+
 If you want to hard-stop the model from calling OpenCode's built-in `task` tool, you can safely deny it once this plugin is installed:
 
 ```json
@@ -167,7 +222,9 @@ If you want to hard-stop the model from calling OpenCode's built-in `task` tool,
     "task": "deny",
     "bg_task": "allow",
     "bg_task_list": "allow",
-    "bg_task_reconcile": "allow"
+    "bg_task_reconcile": "allow",
+    "bg_task_question_list": "allow",
+    "bg_task_question_reply": "allow"
   }
 }
 ```
@@ -190,10 +247,29 @@ Root Session
   ├─ (continues working)
   │
   └─ ◄── Completion callback ──────── Child session goes idle
-                                       ├─ Extracts final result
-                                       ├─ Collects changed files + patch
-                                       └─ Queues result into parent session
+                                        ├─ Extracts final result
+                                        ├─ Collects changed files + patch
+                                        └─ Queues result into parent session
 ```
+
+### Child-question relay flow
+
+```
+Parent session
+  │
+  ├─ bg_task(...) ───────────────► Child session starts work
+  │
+  ├─ ◄── Question notice ──────── Child emits question.asked
+  │                              ├─ Plugin records pending request
+  │                              └─ Plugin posts a notice to parent
+  │
+  ├─ bg_task_question_list()
+  ├─ bg_task_question_reply(...)
+  │
+  └─ ──► client.question.reply ── Child session resumes with answer
+```
+
+This is a plugin-level inbox, not a native OpenCode question dock. The plugin can relay and answer child questions from the parent session, but it cannot create a true built-in question UI in the parent because the public OpenCode plugin API does not expose question creation hooks.
 
 ### Overlap detection
 

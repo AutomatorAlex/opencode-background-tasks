@@ -18,6 +18,7 @@ export default async (ctx) => {
   const reconciliations = new Map();
   const delegatedSessionParents = new Map();
   const taskIdToSessionId = new Map();
+  const pendingQuestionRelays = new Map();
   const agentsDirectory = path.join(homeDirectory, ".config", "opencode", "agents");
   const coreAgentNames = new Set(["build", "consultant", "debug", "plan"]);
   const taskArtifactsDirectory = path.join(homeDirectory, ".local", "share", "opencode", "background-task-artifacts");
@@ -267,6 +268,7 @@ export default async (ctx) => {
       "- For editing tasks, provide targets whenever possible so the task system can detect overlapping file claims.",
       "- Root sessions can fan out multiple tasks in parallel as long as their claimed targets do not overlap.",
       "- Child sessions cannot delegate further; send follow-on delegation back to the root/orchestrator session.",
+      "- If a child session asks a question, the plugin relays it back to the parent session. Answer it with bg_task_question_reply or inspect pending items with bg_task_question_list.",
       "- In non-git workspaces, parallel shared tasks without distinct explicit targets are treated as overlapping. To fan out multiple tasks there, give each task unique targets.",
       "- mode=auto will use the main workspace when claims are non-overlapping, and will prefer an isolated git worktree when file claims are missing or overlapping.",
       "- mode=shared keeps the task in the main workspace and should only be used when you are confident the task will not overlap active edits.",
@@ -523,6 +525,142 @@ export default async (ctx) => {
     if (record.reconcileStatus) lines.push(`Reconcile status: ${record.reconcileStatus}`);
 
     return lines.join("\n");
+  }
+
+  function taskAliasesForSession(sessionID) {
+    return Array.from(taskIdToSessionId.entries())
+      .filter(([, mappedSessionID]) => mappedSessionID === sessionID)
+      .map(([taskID]) => taskID);
+  }
+
+  function formatQuestionPrompt(question, index) {
+    const lines = [`Q${index + 1}. ${question.question}`];
+    if (question.header) lines.push(`   Header: ${question.header}`);
+    lines.push(`   Multiple: ${question.multiple ? "yes" : "no"}`);
+    lines.push(`   Custom answers: ${question.custom === false ? "no" : "yes"}`);
+
+    if (question.options?.length) {
+      lines.push(`   Options: ${question.options.map((option) => option.label).join(" | ")}`);
+      for (const option of question.options) {
+        if (option.description) {
+          lines.push(`     - ${option.label}: ${option.description}`);
+        }
+      }
+    } else {
+      lines.push("   Options: (custom answer only)");
+    }
+
+    return lines;
+  }
+
+  function formatQuestionRelay(relay, { includeInstructions = false } = {}) {
+    const lines = [
+      `Task: ${relay.title}`,
+      `Child session: opencode://session/${relay.childSessionID}`,
+      `Request ID: ${relay.requestID}`,
+    ];
+
+    if (relay.taskIDs?.length) {
+      lines.push(`Logical task IDs: ${relay.taskIDs.join(", ")}`);
+    }
+
+    for (const [index, question] of relay.questions.entries()) {
+      lines.push(...formatQuestionPrompt(question, index));
+    }
+
+    if (includeInstructions) {
+      lines.push(
+        "",
+        "Use bg_task_question_reply from this parent session after the user answers.",
+        "Use bg_task_question_list to review all pending background-task questions.",
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  function visibleQuestionRelays(parentSessionID, includeAll = false) {
+    return Array.from(pendingQuestionRelays.values())
+      .filter((relay) => includeAll || !parentSessionID || relay.parentSessionID === parentSessionID)
+      .sort((left, right) => left.createdAt - right.createdAt);
+  }
+
+  function normalizeQuestionAnswers(answers) {
+    if (!Array.isArray(answers)) return [];
+
+    return answers.map((answer) => {
+      const values = Array.isArray(answer) ? answer : [answer];
+      return uniq(
+        values
+          .map((value) => (typeof value === "string" ? value : String(value ?? "")))
+          .map((value) => value.trim())
+          .filter(Boolean),
+      );
+    });
+  }
+
+  function resolveQuestionRelay({ request_id, task_id }, parentSessionID) {
+    if (request_id) {
+      const relay = pendingQuestionRelays.get(request_id);
+      if (!relay) {
+        throw new Error(`Unknown request_id: ${request_id}`);
+      }
+      if (parentSessionID && relay.parentSessionID !== parentSessionID) {
+        throw new Error(`Question ${request_id} belongs to a different parent session.`);
+      }
+      return relay;
+    }
+
+    if (!task_id) {
+      throw new Error("Provide either request_id or task_id.");
+    }
+
+    const resolvedTaskSessionID = taskIdToSessionId.get(task_id) || task_id;
+    const allMatches = Array.from(pendingQuestionRelays.values()).filter((relay) => relay.childSessionID === resolvedTaskSessionID);
+    const matches = allMatches.filter((relay) => {
+      if (relay.childSessionID !== resolvedTaskSessionID) return false;
+      if (parentSessionID && relay.parentSessionID !== parentSessionID) return false;
+      return true;
+    });
+
+    if (!matches.length && allMatches.length && parentSessionID) {
+      throw new Error(`Pending question for ${task_id} belongs to a different parent session.`);
+    }
+
+    if (!matches.length) {
+      throw new Error(`No pending background-task question found for task_id: ${task_id}`);
+    }
+
+    if (matches.length > 1) {
+      throw new Error(
+        `Multiple pending questions are waiting for ${task_id}. Use request_id instead: ${matches.map((relay) => relay.requestID).join(", ")}`,
+      );
+    }
+
+    return matches[0];
+  }
+
+  async function notifyParentOfQuestion(relay) {
+    await client.session.prompt({
+      path: { id: relay.parentSessionID },
+      body: {
+        parts: [
+          {
+            type: "text",
+            text: [
+              "A background task is blocked waiting for user input.",
+              "",
+              formatQuestionRelay(relay, { includeInstructions: true }),
+            ].join("\n"),
+          },
+        ],
+        noReply: false,
+        agent: relay.parentAgent,
+        model: relay.parentModel,
+        variant: relay.parentVariant,
+        system: "This is an asynchronous background-task question notice. A child session is waiting for user input. Ask the user for the answer here, then use bg_task_question_reply to send the answer back to the blocked child session. If multiple background questions are pending, inspect them with bg_task_question_list before replying.",
+      },
+    });
   }
 
   async function cleanupReconciliation(record) {
@@ -901,6 +1039,70 @@ export default async (ctx) => {
           }
         },
       }),
+      bg_task_question_list: tool({
+        description: "List pending background-task questions from child sessions. By default this is scoped to the current parent session.",
+        args: {
+          all: tool.schema.boolean().optional().describe("Set true to list pending questions across all parent sessions instead of only the current one."),
+        },
+        async execute({ all = false }, context) {
+          const relays = visibleQuestionRelays(context.sessionID, all);
+          if (!relays.length) return "No pending background-task questions.";
+
+          return relays
+            .map((relay) => [
+              formatQuestionRelay(relay),
+              `Reply with: bg_task_question_reply(request_id: "${relay.requestID}", action: "reply", answers: [["..."]])`,
+            ].join("\n"))
+            .join("\n\n────────────────────\n\n");
+        },
+      }),
+      bg_task_question_reply: tool({
+        description: "Reply to or reject a pending background-task question from a child session without opening that child session.",
+        args: {
+          request_id: tool.schema.string().optional().describe("The pending question request ID from bg_task_question_list."),
+          task_id: tool.schema.string().optional().describe("Optional logical task ID or child session ID. Use this instead of request_id when there is only one pending question for that task."),
+          action: tool.schema.enum(["reply", "reject"]).describe("reply sends answers back to the blocked child session. reject dismisses the pending question."),
+          answers: tool.schema.array(tool.schema.union([tool.schema.string(), tool.schema.array(tool.schema.string())])).optional().describe("Answers in question order. Each item may be a single string for a normal/custom answer, or an array of strings for a multi-select question."),
+        },
+        async execute({ request_id, task_id, action, answers = [] }, context) {
+          try {
+            const relay = resolveQuestionRelay({ request_id, task_id }, context.sessionID);
+
+            if (action === "reject") {
+              await client.question.reject({ requestID: relay.requestID });
+              pendingQuestionRelays.delete(relay.requestID);
+              return [
+                `✓ Rejected background-task question for ${relay.title}.`,
+                `Child session: opencode://session/${relay.childSessionID}`,
+                `Request ID: ${relay.requestID}`,
+              ].join("\n");
+            }
+
+            const normalizedAnswers = normalizeQuestionAnswers(answers);
+            if (normalizedAnswers.length !== relay.questions.length) {
+              return [
+                `✗ Expected ${relay.questions.length} answer set(s) for request ${relay.requestID}, but received ${normalizedAnswers.length}.`,
+                "Provide one answer entry per question in order.",
+                formatQuestionRelay(relay),
+              ].join("\n\n");
+            }
+
+            await client.question.reply({
+              requestID: relay.requestID,
+              answers: normalizedAnswers,
+            });
+            pendingQuestionRelays.delete(relay.requestID);
+
+            return [
+              `✓ Sent answers to background task ${relay.title}.`,
+              `Child session: opencode://session/${relay.childSessionID}`,
+              `Request ID: ${relay.requestID}`,
+            ].join("\n");
+          } catch (error) {
+            return `✗ Failed to respond to background-task question: ${error.message}`;
+          }
+        },
+      }),
     },
 
     "tool.execute.after": async (input, output) => {
@@ -921,6 +1123,50 @@ export default async (ctx) => {
     event: async ({ event }) => {
       const isIdle = event.type === "session.idle" || (event.type === "session.status" && event.properties?.status?.type === "idle");
       const childSessionID = event.properties?.sessionID;
+
+      if (event.type === "question.asked") {
+        const childQuestionSessionID = event.properties?.sessionID;
+        const parentSessionID = childQuestionSessionID
+          ? trackedSessions.get(childQuestionSessionID)?.parentSessionID || delegatedSessionParents.get(childQuestionSessionID)
+          : undefined;
+        const tracked = childQuestionSessionID ? trackedSessions.get(childQuestionSessionID) : undefined;
+
+        if (childQuestionSessionID && parentSessionID && tracked) {
+          const relay = {
+            requestID: event.properties.id,
+            childSessionID: childQuestionSessionID,
+            parentSessionID,
+            title: tracked.title,
+            questions: event.properties.questions,
+            parentAgent: tracked.parentAgent,
+            parentModel: tracked.parentModel,
+            parentVariant: tracked.parentVariant,
+            taskIDs: taskAliasesForSession(childQuestionSessionID),
+            createdAt: Date.now(),
+          };
+
+          pendingQuestionRelays.set(relay.requestID, relay);
+
+          try {
+            await notifyParentOfQuestion(relay);
+          } catch (error) {
+            try {
+              await client.app.log({
+                body: {
+                  service: "bg_task",
+                  level: "error",
+                  message: "Error relaying delegated session question to parent",
+                  extra: { childSessionID: childQuestionSessionID, requestID: relay.requestID, error: error.message },
+                },
+              });
+            } catch {}
+          }
+        }
+      }
+
+      if (event.type === "question.replied" || event.type === "question.rejected") {
+        pendingQuestionRelays.delete(event.properties?.requestID);
+      }
 
       if (childSessionID && isIdle) {
         const tracked = trackedSessions.get(childSessionID);
