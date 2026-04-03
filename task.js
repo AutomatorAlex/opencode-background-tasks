@@ -589,7 +589,7 @@ export default async (ctx) => {
     if (artifacts.changedFiles?.length) footer.push(`Changed files: ${artifacts.changedFiles.join(", ")}`);
     if (artifacts.patchPath) {
       footer.push(`Patch: ${artifacts.patchPath}`);
-      footer.push(`Reconcile: task_reconcile(task_id: "${childSessionID}", action: "status" | "apply" | "cleanup")`);
+      footer.push(`Reconcile: bg_task_reconcile(task_id: "${childSessionID}", action: "status" | "apply" | "cleanup")`);
     }
 
     const text = [
@@ -616,7 +616,7 @@ export default async (ctx) => {
 
   return {
     tool: {
-      task: tool({
+      bg_task: tool({
         description: buildTaskDescription(),
         args: {
           prompt: tool.schema.string().describe("The task for the agent to perform."),
@@ -809,7 +809,7 @@ export default async (ctx) => {
           }
         },
       }),
-      task_list: tool({
+      bg_task_list: tool({
         description: "List all active background tasks and any completed isolated tasks waiting for reconciliation.",
         args: {},
         async execute() {
@@ -842,7 +842,7 @@ export default async (ctx) => {
           ].filter(Boolean).join("\n\n");
         },
       }),
-      task_reconcile: tool({
+      bg_task_reconcile: tool({
         description: "Inspect or apply the recorded patch from an isolated background task back onto the main workspace.",
         args: {
           task_id: tool.schema.string().describe("The task session ID to inspect or reconcile."),
@@ -904,7 +904,7 @@ export default async (ctx) => {
     },
 
     "tool.execute.after": async (input, output) => {
-      if (!["task", "task_reconcile"].includes(input.tool)) return;
+      if (!["bg_task", "bg_task_reconcile"].includes(input.tool)) return;
       if (!output?.output) return;
 
       const decoded = decodeToolResult(output.output);
@@ -934,7 +934,7 @@ export default async (ctx) => {
             try {
               await client.app.log({
                 body: {
-                  service: "task",
+                  service: "bg_task",
                   level: "error",
                   message: "Error processing delegated session completion",
                   extra: { childSessionID, error: error.message },

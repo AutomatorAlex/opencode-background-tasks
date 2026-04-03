@@ -44,6 +44,8 @@ cp task.js ~/.config/opencode/plugins/task.js
 
 OpenCode automatically loads `.js` plugins from `~/.config/opencode/plugins/` — no config changes needed.
 
+This plugin intentionally registers `bg_task`, `bg_task_list`, and `bg_task_reconcile` instead of `task*` names so it does not collide with OpenCode's built-in `task` tool.
+
 ### From this repo
 
 ```bash
@@ -58,7 +60,7 @@ Once installed, three new tools become available in every OpenCode session:
 ### Delegate a task
 
 ```
-task(
+bg_task(
   prompt: "Refactor the auth module to use JWT tokens",
   subagent_type: "build",
   description: "Refactor auth to JWT",
@@ -70,9 +72,9 @@ task(
 ### Fan out parallel work
 
 ```
-task(prompt: "Write unit tests for the API layer", subagent_type: "build", targets: ["tests/api/**"])
-task(prompt: "Update the README with new endpoints", subagent_type: "build", targets: ["README.md"])
-task(prompt: "Plan the database migration strategy", subagent_type: "plan", targets: ["docs/migration.md"])
+bg_task(prompt: "Write unit tests for the API layer", subagent_type: "build", targets: ["tests/api/**"])
+bg_task(prompt: "Update the README with new endpoints", subagent_type: "build", targets: ["README.md"])
+bg_task(prompt: "Plan the database migration strategy", subagent_type: "plan", targets: ["docs/migration.md"])
 ```
 
 All three run concurrently because their targets don't overlap.
@@ -80,7 +82,7 @@ All three run concurrently because their targets don't overlap.
 ### Reuse a task session
 
 ```
-task(
+bg_task(
   prompt: "Continue the auth refactor — add refresh token support",
   subagent_type: "build",
   task_id: "auth_refactor",
@@ -92,7 +94,7 @@ If `auth_refactor` was used before, the existing session is reused. Otherwise a 
 
 ## Tools
 
-### `task`
+### `bg_task`
 
 Launch a background agent task.
 
@@ -106,11 +108,11 @@ Launch a background agent task.
 | `mode` | `"auto"` \| `"shared"` \| `"isolated"` | no | Workspace strategy (default: `auto`) |
 | `command` | string | no | The command that triggered this task |
 
-### `task_list`
+### `bg_task_list`
 
 List all active background tasks and any completed isolated tasks waiting for reconciliation.
 
-### `task_reconcile`
+### `bg_task_reconcile`
 
 Inspect or apply patches from isolated background tasks.
 
@@ -145,6 +147,33 @@ Background task artifacts (worktrees, patches) are stored in:
 └── patches/      # Recorded patches from completed isolated tasks
 ```
 
+### Collision avoidance
+
+OpenCode already ships a built-in `task` tool for subagents. Earlier versions of this plugin used the same tool name, which could surface core `task_id` validation errors like `Invalid string: must start with "ses"` when OpenCode treated a logical task ID as a native session ID.
+
+To avoid that conflict, this plugin now exports distinct tool names:
+
+- `bg_task`
+- `bg_task_list`
+- `bg_task_reconcile`
+
+If you want to hard-stop the model from calling OpenCode's built-in `task` tool, you can safely deny it once this plugin is installed:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "*": "allow",
+    "task": "deny",
+    "bg_task": "allow",
+    "bg_task_list": "allow",
+    "bg_task_reconcile": "allow"
+  }
+}
+```
+
+If you are upgrading from an older version, restart OpenCode and update any prompts, saved snippets, or docs that still reference `task`, `task_list`, or `task_reconcile` for this plugin.
+
 ## How It Works
 
 ### Delegation flow
@@ -152,7 +181,7 @@ Background task artifacts (worktrees, patches) are stored in:
 ```
 Root Session
   │
-  ├─ task(prompt, agent, targets) ──► Creates child session
+  ├─ bg_task(prompt, agent, targets) ──► Creates child session
   │                                    ├─ Checks for target conflicts
   │                                    ├─ Resolves workspace mode (shared/isolated)
   │                                    ├─ Creates git worktree if isolated
