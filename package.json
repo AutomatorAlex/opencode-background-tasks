@@ -1,0 +1,29 @@
+{
+  "name": "opencode-background-tasks",
+  "version": "1.0.0",
+  "description": "Background task delegation and orchestration plugin for OpenCode",
+  "type": "module",
+  "main": "task.js",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "background-tasks",
+    "delegation",
+    "orchestration",
+    "multi-agent",
+    "worktree"
+  ],
+  "author": "Alex De Gracia <alex@everydayworkflows.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AutomatorAlex/opencode-background-tasks.git"
+  },
+  "homepage": "https://github.com/AutomatorAlex/opencode-background-tasks",
+  "bugs": {
+    "url": "https://github.com/AutomatorAlex/opencode-background-tasks/issues"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}
