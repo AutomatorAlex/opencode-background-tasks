@@ -1200,10 +1200,9 @@ A task should be delegated if:
 3. It can be parallelized into multiple independent tasks.
 
 Agent Selection Rules:
-- The 'consultant' agent is strictly for business strategy, contractor tasks, and non-coding business analysis. NEVER use it for software architecture, code review, or programming.
-- The 'plan' agent is for software architecture, breaking down technical tasks, and creating coding implementation plans.
-- The 'build' agent is for writing and modifying code.
-- The 'debug' agent is for fixing errors and investigating bugs.
+- ONLY use the agents explicitly listed in the 'Available agents' list above.
+- Match the user's request to the agent's description carefully.
+- Pay close attention to whether an agent is meant for coding vs non-coding tasks. Do not use non-coding/business agents for software architecture or programming.
 
 If delegation is needed, recommend a strategy.
 Return ONLY valid JSON in this exact format:
