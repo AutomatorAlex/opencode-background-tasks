@@ -4,6 +4,44 @@ import path from "path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+
+// --- MOE Auto-Assessment Helpers ---
+async function callModelForAssessment(model, prompt) {
+  const slashIdx = model.indexOf("/");
+  const providerID = slashIdx > -1 ? model.slice(0, slashIdx) : "openai";
+  const modelID = slashIdx > -1 ? model.slice(slashIdx + 1) : model;
+
+  const providerConfigs = {
+    openai: { url: "https://api.openai.com/v1/chat/completions", key: process.env.OPENAI_API_KEY },
+    openrouter: { url: "https://openrouter.ai/api/v1/chat/completions", key: process.env.OPENROUTER_API_KEY },
+    anthropic: { url: "https://api.anthropic.com/v1/messages", key: process.env.ANTHROPIC_API_KEY },
+  };
+
+  const provider = providerConfigs[providerID];
+  if (!provider?.key) throw new Error(`No API key found for provider: ${providerID}`);
+
+  const res = await fetch(provider.url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${provider.key}` },
+    body: JSON.stringify({
+      model: modelID,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0,
+      max_tokens: 1000,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`API error ${res.status}: ${text}`);
+  }
+
+  const data = await res.json();
+  return providerID === "anthropic" ? data.content[0].text : data.choices[0].message.content;
+}
+
+const assessedMessages = new Set();
+
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 20 * 1024 * 1024;
 
@@ -242,6 +280,15 @@ export default async (ctx) => {
   }
 
   const agentCatalog = await loadAgentCatalog();
+
+  let opencodeConfig = {};
+  try {
+    const rawConfig = await fs.readFile(path.join(homeDirectory, ".config", "opencode", "opencode.json"), "utf8");
+    opencodeConfig = JSON.parse(rawConfig);
+  } catch (e) {
+    console.error("[task] Failed to read opencode.json for MOE assessment:", e.message);
+  }
+
 
   function resolveAgent(requestedAgent) {
     const normalized = normalizeAgentKey(requestedAgent);
@@ -1122,6 +1169,80 @@ export default async (ctx) => {
 
     event: async ({ event }) => {
       const isIdle = event.type === "session.idle" || (event.type === "session.status" && event.properties?.status?.type === "idle");
+
+      // MOE Auto-Assessment
+      if (event.type === "message.updated" && event.message?.role === "user" && event.message?.id) {
+        const msgId = event.message.id;
+        const text = event.message.content || event.message.text || event.message.parts?.[0]?.text || "";
+        const sessionId = event.properties?.sessionID || context.sessionID;
+        
+        // Only run assessment on substantial user messages that haven't been assessed yet
+        // and avoid triggering on short commands or generic chat
+        if (text.length > 50 && !assessedMessages.has(msgId)) {
+          // We mark it as assessed immediately to avoid multiple triggers during streaming
+          assessedMessages.add(msgId);
+          
+          // Fire and forget the assessment
+          (async () => {
+            try {
+              const model = opencodeConfig.small_model || "openrouter/google/gemini-3-flash-preview";
+              const prompt = `Analyze this user request and determine if it should be delegated to specialized agents using the Mixture of Experts (MoE) pattern.
+The primary agent has access to a 'bg_task' tool that can launch background subagents.
+
+User request: "${text}"
+
+Available agents:
+${agentCatalog.map(a => "- " + a.name + ": " + a.description).join("\n")}
+
+A task should be delegated if:
+1. It involves multiple distinct domains (e.g. frontend vs backend, database vs UI).
+2. It requires significant research + implementation.
+3. It can be parallelized into multiple independent tasks.
+
+If delegation is needed, recommend a strategy.
+Return ONLY valid JSON in this exact format:
+{
+  "delegate": true|false,
+  "reason": "Brief explanation of why",
+  "strategy": "Sequential, Parallel, or MoE",
+  "agents": ["agent1", "agent2"],
+  "advice": "Short prompt to the primary agent telling it exactly how to use bg_task to delegate this."
+}`;
+
+              const resultText = await callModelForAssessment(model, prompt);
+              
+              // Clean up the response in case it's wrapped in markdown
+              const jsonStr = resultText.replace(/^\s*\x60\x60\x60json\n/, '').replace(/\n\x60\x60\x60\s*$/, '').trim();
+              const assessment = JSON.parse(jsonStr);
+
+              if (assessment.delegate) {
+                // Inject the assessment advice as a system message to guide the primary agent
+                const adviceText = `[System: MOE Delegation Assessment]
+The user's request is complex and should be delegated.
+Reasoning: ${assessment.reason}
+Recommended Strategy: ${assessment.strategy}
+Agents to use: ${assessment.agents.join(", ")}
+
+Advice for you (the orchestrator): ${assessment.advice}
+Please use the bg_task or bg_task_start_batch tools to execute this strategy before responding to the user.`;
+
+                await client.session.prompt({
+                  path: { id: sessionId },
+                  body: {
+                    parts: [{ type: "text", text: adviceText }],
+                    noReply: true,
+                    system: "This is an internal system directive. Acknowledge it by following the delegation advice."
+                  }
+                });
+                console.log(`[task] MOE assessment completed and injected for session ${sessionId}`);
+              }
+            } catch (err) {
+              console.error("[task] MOE assessment failed:", err.message);
+            }
+          })();
+        }
+      }
+
       const childSessionID = event.properties?.sessionID;
 
       if (event.type === "question.asked") {
