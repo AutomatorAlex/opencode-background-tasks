@@ -263,17 +263,20 @@ export default async (ctx) => {
 
         if (name === "build") aliases.push("code");
 
+        const mode = parseFrontmatterValue(source, "mode");
         return {
           name,
           description,
           variant: parseFrontmatterValue(source, "variant"),
           model: parseModelString(parseFrontmatterValue(source, "model")),
           aliases: Array.from(new Set([name, ...aliases])),
+          mode,
         };
       }),
     );
 
     return catalog
+      .filter((agent) => !agent.mode || agent.mode === "all" || agent.mode === "subagent")
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
