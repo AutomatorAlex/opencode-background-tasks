@@ -58,8 +58,7 @@ export default async (ctx) => {
   const taskIdToSessionId = new Map();
   const pendingQuestionRelays = new Map();
   const agentsDirectory = path.join(homeDirectory, ".config", "opencode", "agents");
-  const coreAgentNames = new Set(["build", "consultant", "debug", "plan"]);
-  const taskArtifactsDirectory = path.join(homeDirectory, ".local", "share", "opencode", "background-task-artifacts");
+    const taskArtifactsDirectory = path.join(homeDirectory, ".local", "share", "opencode", "background-task-artifacts");
   const worktreesDirectory = path.join(taskArtifactsDirectory, "worktrees");
   const patchesDirectory = path.join(taskArtifactsDirectory, "patches");
   const RESULT_PREFIX = "__OPENCODE_BACKGROUND_TASK_META__";
@@ -275,7 +274,6 @@ export default async (ctx) => {
     );
 
     return catalog
-      .filter((agent) => coreAgentNames.has(agent.name))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
