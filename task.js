@@ -44,6 +44,11 @@ const assessedMessages = new Set();
 
 const execFileAsync = promisify(execFile);
 const MAX_BUFFER = 20 * 1024 * 1024;
+const MAX_ASSESSED_MESSAGES = 1000;
+const QUESTION_RELAY_TTL_MS = 24 * 60 * 60 * 1000;
+const COMPLETION_RETRY_INTERVAL_MS = 500;
+const COMPLETION_RETRY_MAX_MS = 5000;
+const STATE_FILE = "bg-task-state.json";
 
 /**
  * @type {import("@opencode-ai/plugin").Plugin}
@@ -52,20 +57,112 @@ export default async (ctx) => {
   const { client } = ctx;
   const rootDirectory = ctx.worktree || ctx.directory;
   const homeDirectory = process.env.HOME || rootDirectory;
+  let repositoryRoot = null;
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", rootDirectory, "rev-parse", "--show-toplevel"], { maxBuffer: MAX_BUFFER });
+    repositoryRoot = stdout.trim() || null;
+  } catch {}
+
+  const artifactRoot = repositoryRoot
+    ? path.join(repositoryRoot, ".opencode")
+    : path.join(homeDirectory, ".local", "share", "opencode", "background-task-artifacts");
+
   const trackedSessions = new Map();
   const reconciliations = new Map();
   const delegatedSessionParents = new Map();
   const taskIdToSessionId = new Map();
   const pendingQuestionRelays = new Map();
+  const pendingQuestionRelaysBySession = new Map();
   const agentsDirectory = path.join(homeDirectory, ".config", "opencode", "agents");
-    const taskArtifactsDirectory = path.join(homeDirectory, ".local", "share", "opencode", "background-task-artifacts");
+  const taskArtifactsDirectory = artifactRoot;
   const worktreesDirectory = path.join(taskArtifactsDirectory, "worktrees");
   const patchesDirectory = path.join(taskArtifactsDirectory, "patches");
+  const stateFilePath = path.join(taskArtifactsDirectory, STATE_FILE);
   const RESULT_PREFIX = "__OPENCODE_BACKGROUND_TASK_META__";
-  let cachedRepositoryRoot;
 
+  await fs.mkdir(taskArtifactsDirectory, { recursive: true });
   await fs.mkdir(worktreesDirectory, { recursive: true });
   await fs.mkdir(patchesDirectory, { recursive: true });
+
+  function pruneAssessedMessages() {
+    if (assessedMessages.size <= MAX_ASSESSED_MESSAGES) return;
+    const overflow = assessedMessages.size - MAX_ASSESSED_MESSAGES;
+    let removed = 0;
+    for (const id of assessedMessages) {
+      assessedMessages.delete(id);
+      removed += 1;
+      if (removed >= overflow) break;
+    }
+  }
+
+  function purgeStaleQuestionRelays() {
+    const cutoff = Date.now() - QUESTION_RELAY_TTL_MS;
+    for (const relay of pendingQuestionRelays.values()) {
+      if ((relay.createdAt || 0) < cutoff) {
+        deletePendingQuestionRelay(relay);
+      }
+    }
+  }
+
+  function serializeMap(map) {
+    return Array.from(map.entries());
+  }
+
+  function deserializeMap(entries) {
+    return new Map(Array.isArray(entries) ? entries : []);
+  }
+
+  async function persistTaskState() {
+    const payload = {
+      trackedSessions: serializeMap(trackedSessions),
+      reconciliations: serializeMap(reconciliations),
+      delegatedSessionParents: serializeMap(delegatedSessionParents),
+      taskIdToSessionId: serializeMap(taskIdToSessionId),
+      pendingQuestionRelays: serializeMap(pendingQuestionRelays),
+    };
+    await fs.writeFile(stateFilePath, JSON.stringify(payload, null, 2), "utf8");
+  }
+
+  async function loadPersistedTaskState() {
+    try {
+      const raw = await fs.readFile(stateFilePath, "utf8");
+      const parsed = JSON.parse(raw);
+
+      for (const [key, value] of deserializeMap(parsed.trackedSessions)) trackedSessions.set(key, value);
+      for (const [key, value] of deserializeMap(parsed.reconciliations)) reconciliations.set(key, value);
+      for (const [key, value] of deserializeMap(parsed.delegatedSessionParents)) delegatedSessionParents.set(key, value);
+      for (const [key, value] of deserializeMap(parsed.taskIdToSessionId)) taskIdToSessionId.set(key, value);
+      for (const [key, value] of deserializeMap(parsed.pendingQuestionRelays)) {
+        pendingQuestionRelays.set(key, value);
+        if (value?.childSessionID) pendingQuestionRelaysBySession.set(value.childSessionID, value);
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        console.error("[task] Failed to load persisted task state:", error.message);
+      }
+    }
+  }
+
+  async function withPersistedState(mutator) {
+    const result = await mutator();
+    await persistTaskState();
+    return result;
+  }
+
+  async function logApp(level, message, extra = {}) {
+    try {
+      await client.app.log({
+        body: {
+          service: "bg_task",
+          level,
+          message,
+          extra,
+        },
+      });
+    } catch {}
+  }
+
+  await loadPersistedTaskState();
 
   function normalizeAgentKey(value = "") {
     return value
@@ -191,6 +288,75 @@ export default async (ctx) => {
 
   function normalizeTargets(targets, root) {
     return uniq((targets || []).map((target) => normalizeTarget(target, root)));
+  }
+
+  function isTargetInsideRoot(target, root) {
+    if (!target || !root) return false;
+    const resolved = path.isAbsolute(target) ? path.normalize(target) : path.normalize(path.join(root, target));
+    const normalizedRoot = path.normalize(root);
+    return resolved === normalizedRoot || resolved.startsWith(normalizedRoot + path.sep);
+  }
+
+  async function verifyExternalTargets(targets, root) {
+    const externalTargets = (targets || []).filter((target) => !hasGlobSyntax(target) && !isTargetInsideRoot(target, root));
+    if (!externalTargets.length) {
+      return { externalTargets: [], existingTargets: [] };
+    }
+
+    const existingTargets = [];
+    for (const target of externalTargets) {
+      const resolved = path.isAbsolute(target) ? path.normalize(target) : path.normalize(path.join(root, target));
+      try {
+        await fs.stat(resolved);
+        existingTargets.push(toPosixPath(resolved));
+      } catch {}
+    }
+
+    return { externalTargets, existingTargets };
+  }
+
+  async function verifyExternalTargetsInWorkspace(targets, workspacePath, root) {
+    const externalTargets = (targets || []).filter((target) => !hasGlobSyntax(target) && !isTargetInsideRoot(target, root));
+    if (!externalTargets.length) {
+      return { externalTargets: [], existingTargets: [] };
+    }
+
+    const existingTargets = [];
+    for (const target of externalTargets) {
+      const workspaceRelative = target.replace(/^\/+/, "");
+      const candidatePaths = [
+        path.join(workspacePath, workspaceRelative),
+        path.join(workspacePath, target),
+      ];
+
+      for (const candidate of candidatePaths) {
+        try {
+          await fs.stat(candidate);
+          existingTargets.push(toPosixPath(candidate));
+          break;
+        } catch {}
+      }
+    }
+
+    return { externalTargets, existingTargets };
+  }
+
+  async function verifyExternalTargetsOnHost(targets, root) {
+    const externalTargets = (targets || []).filter((target) => !hasGlobSyntax(target) && !isTargetInsideRoot(target, root));
+    if (!externalTargets.length) {
+      return { externalTargets: [], existingTargets: [] };
+    }
+
+    const existingTargets = [];
+    for (const target of externalTargets) {
+      const resolved = path.isAbsolute(target) ? path.normalize(target) : path.normalize(path.join(root, target));
+      try {
+        await fs.stat(resolved);
+        existingTargets.push(toPosixPath(resolved));
+      } catch {}
+    }
+
+    return { externalTargets, existingTargets };
   }
 
   function cleanTargetToken(value = "") {
@@ -448,14 +614,12 @@ export default async (ctx) => {
   }
 
   async function getRepositoryRoot() {
-    if (cachedRepositoryRoot !== undefined) return cachedRepositoryRoot;
     try {
       const { stdout } = await runGit(rootDirectory, ["rev-parse", "--show-toplevel"]);
-      cachedRepositoryRoot = stdout.trim();
+      return stdout.trim();
     } catch {
-      cachedRepositoryRoot = null;
+      return null;
     }
-    return cachedRepositoryRoot;
   }
 
   function buildWorktreeToken() {
@@ -472,21 +636,18 @@ export default async (ctx) => {
     return {
       workspacePath,
       branchName,
+      baseRef: "HEAD",
     };
   }
 
   async function safeRemoveWorktree(repositoryRoot, workspacePath) {
     if (!repositoryRoot || !workspacePath) return;
-    try {
-      await runGit(repositoryRoot, ["worktree", "remove", "--force", workspacePath]);
-    } catch {}
+    await runGit(repositoryRoot, ["worktree", "remove", "--force", workspacePath]);
   }
 
   async function safeDeleteBranch(repositoryRoot, branchName) {
     if (!repositoryRoot || !branchName) return;
-    try {
-      await runGit(repositoryRoot, ["branch", "-D", branchName]);
-    } catch {}
+    await runGit(repositoryRoot, ["branch", "-D", branchName]);
   }
 
   function findConflicts(targets, sessionToIgnore) {
@@ -529,12 +690,50 @@ export default async (ctx) => {
 
   async function collectCompletionArtifacts(tracked) {
     const artifact = {
-      changedFiles: tracked.claimedTargets || [],
+      changedFiles: [],
       patchPath: undefined,
       reconcileStatus: undefined,
+      verificationStatus: "summary-only",
+      externalTargets: [],
     };
 
+    const externalCheckRoot = tracked.repositoryRoot || rootDirectory;
+    const claimedTargets = tracked.claimedTargets || [];
+    const [workspaceExternalVerification, hostExternalVerification] = await Promise.all([
+      tracked.workspacePath
+        ? verifyExternalTargetsInWorkspace(claimedTargets, tracked.workspacePath, externalCheckRoot)
+        : Promise.resolve({ externalTargets: [], existingTargets: [] }),
+      verifyExternalTargetsOnHost(claimedTargets, externalCheckRoot),
+    ]);
+    const externalTargets = uniq([
+      ...workspaceExternalVerification.existingTargets,
+      ...hostExternalVerification.existingTargets,
+    ]);
+    artifact.externalTargets = externalTargets;
+
+    if (tracked.effectiveMode === "shared" && tracked.repositoryRoot) {
+      try {
+        const changedFiles = await listTrackedFiles(tracked.repositoryRoot);
+        artifact.changedFiles = changedFiles;
+        if (changedFiles.length) {
+          artifact.reconcileStatus = "shared-unverified";
+          artifact.verificationStatus = "workspace-verified";
+        } else if (externalTargets.length) {
+          artifact.reconcileStatus = "external-only";
+          artifact.verificationStatus = "external-target-verified";
+        } else {
+          artifact.reconcileStatus = "no-changes";
+          artifact.verificationStatus = "no-changes";
+        }
+      } catch {
+        artifact.changedFiles = tracked.claimedTargets || [];
+        artifact.reconcileStatus = artifact.changedFiles.length ? "shared-unverified" : "summary-only";
+      }
+      return artifact;
+    }
+
     if (tracked.effectiveMode !== "isolated" || !tracked.workspacePath || !tracked.repositoryRoot) {
+      artifact.changedFiles = tracked.claimedTargets || [];
       return artifact;
     }
 
@@ -542,16 +741,35 @@ export default async (ctx) => {
     artifact.changedFiles = changedFiles;
 
     if (!changedFiles.length) {
-      artifact.reconcileStatus = "clean";
+      if (externalTargets.length) {
+        artifact.reconcileStatus = "external-only";
+        artifact.verificationStatus = "external-target-verified";
+      } else {
+        artifact.reconcileStatus = "no-changes";
+        artifact.verificationStatus = "no-changes";
+      }
       return artifact;
     }
 
-    const { stdout } = await runGit(tracked.workspacePath, ["diff", "--binary", "HEAD"]);
+    const baseRef = tracked.baseRef || "HEAD";
+    const [headDiffResult, worktreeDiffResult] = await Promise.all([
+      runGit(tracked.workspacePath, ["diff", "--binary", `${baseRef}..HEAD`]).catch(() => ({ stdout: "" })),
+      runGit(tracked.workspacePath, ["diff", "--binary", "HEAD"]).catch(() => ({ stdout: "" })),
+    ]);
+    const stdout = [headDiffResult.stdout, worktreeDiffResult.stdout].filter(Boolean).join("\n");
     const patchPath = path.join(patchesDirectory, `${tracked.sessionID}.patch`);
+
+    if (!stdout.trim()) {
+      artifact.reconcileStatus = changedFiles.length ? "needs-attention" : "no-changes";
+      artifact.verificationStatus = changedFiles.length ? "artifact-mismatch" : "no-changes";
+      return artifact;
+    }
+
     await fs.writeFile(patchPath, stdout, "utf8");
 
     artifact.patchPath = patchPath;
     artifact.reconcileStatus = "pending";
+    artifact.verificationStatus = "artifact-verified";
     return artifact;
   }
 
@@ -569,7 +787,9 @@ export default async (ctx) => {
     if (record.workspacePath) lines.push(`Worktree: ${record.workspacePath}`);
     if (record.branchName) lines.push(`Branch: ${record.branchName}`);
     if (record.changedFiles?.length) lines.push(`Changed files: ${record.changedFiles.join(", ")}`);
+    if (record.externalTargets?.length) lines.push(`External targets: ${record.externalTargets.join(", ")}`);
     if (record.patchPath) lines.push(`Patch: ${record.patchPath}`);
+    if (record.verificationStatus) lines.push(`Verification: ${record.verificationStatus}`);
     if (record.reconcileStatus) lines.push(`Reconcile status: ${record.reconcileStatus}`);
 
     return lines.join("\n");
@@ -631,6 +851,86 @@ export default async (ctx) => {
     return Array.from(pendingQuestionRelays.values())
       .filter((relay) => includeAll || !parentSessionID || relay.parentSessionID === parentSessionID)
       .sort((left, right) => left.createdAt - right.createdAt);
+  }
+
+  function setPendingQuestionRelay(relay) {
+    pendingQuestionRelays.set(relay.requestID, relay);
+    pendingQuestionRelaysBySession.set(relay.childSessionID, relay);
+  }
+
+  function deletePendingQuestionRelay(relayOrRequestID) {
+    const relay = typeof relayOrRequestID === "string"
+      ? pendingQuestionRelays.get(relayOrRequestID)
+      : relayOrRequestID;
+
+    const requestID = typeof relayOrRequestID === "string" ? relayOrRequestID : relayOrRequestID?.requestID;
+    if (requestID) pendingQuestionRelays.delete(requestID);
+    if (relay?.childSessionID) pendingQuestionRelaysBySession.delete(relay.childSessionID);
+  }
+
+  async function getCompletionResultWithRetry(childSessionID) {
+    const deadline = Date.now() + COMPLETION_RETRY_MAX_MS;
+
+    while (Date.now() <= deadline) {
+      const { data: messages } = await client.session.messages({ path: { id: childSessionID }, query: { limit: 50 } });
+      const result = extractFinalResult(messages);
+      if (result) return result;
+      await new Promise((resolve) => setTimeout(resolve, COMPLETION_RETRY_INTERVAL_MS));
+    }
+
+    return null;
+  }
+
+  function removeDelegationStateForSession(sessionID) {
+    delegatedSessionParents.delete(sessionID);
+  }
+
+  function removeTaskMappingsForSession(sessionID) {
+    for (const [taskID, mappedSessionID] of taskIdToSessionId.entries()) {
+      if (mappedSessionID === sessionID) taskIdToSessionId.delete(taskID);
+    }
+  }
+
+  async function markTaskNeedsAttention(tracked, childSessionID, reason, artifacts = {}) {
+    const record = {
+      ...tracked,
+      ...artifacts,
+      sessionID: childSessionID,
+      status: "needs_attention",
+      reconcileStatus: artifacts.reconcileStatus || "needs-attention",
+      verificationStatus: artifacts.verificationStatus || "needs-attention",
+      completedAt: Date.now(),
+      attentionReason: reason,
+    };
+
+    trackedSessions.delete(childSessionID);
+    removeDelegationStateForSession(childSessionID);
+    reconciliations.set(childSessionID, record);
+    await persistTaskState();
+
+    await client.session.prompt({
+      path: { id: tracked.parentSessionID },
+      body: {
+        parts: [{
+          type: "text",
+          text: [
+            `⚠ Background Task Needs Attention: ${tracked.title}`,
+            `Session: opencode://session/${childSessionID}`,
+            "────────────────────",
+            reason,
+            artifacts.verificationStatus ? `Verification: ${artifacts.verificationStatus}` : undefined,
+            artifacts.reconcileStatus ? `Reconcile status: ${artifacts.reconcileStatus}` : undefined,
+            artifacts.changedFiles?.length ? `Changed files: ${artifacts.changedFiles.join(", ")}` : undefined,
+            artifacts.patchPath ? `Patch: ${artifacts.patchPath}` : undefined,
+          ].filter(Boolean).join("\n"),
+        }],
+        noReply: false,
+        agent: tracked.parentAgent,
+        model: tracked.parentModel,
+        variant: tracked.parentVariant,
+        system: "This is an asynchronous background task reliability warning from the task plugin. The task may have incomplete or unverifiable results. Review it before trusting the output.",
+      },
+    });
   }
 
   function normalizeQuestionAnswers(answers) {
@@ -716,7 +1016,7 @@ export default async (ctx) => {
       return "✗ Task has no recorded isolated worktree to clean up.";
     }
 
-    if (!["applied", "clean", "cleaned"].includes(record.reconcileStatus || "")) {
+    if (!["applied", "no-changes", "external-only", "cleaned"].includes(record.reconcileStatus || "")) {
       return `✗ Refusing cleanup for ${record.title} because reconcile status is ${record.reconcileStatus || "pending"}. Apply or inspect it first.`;
     }
 
@@ -724,13 +1024,35 @@ export default async (ctx) => {
       return `✓ Worktree for task ${record.sessionID} has already been cleaned up.`;
     }
 
-    await safeRemoveWorktree(record.repositoryRoot, record.workspacePath);
-    await safeDeleteBranch(record.repositoryRoot, record.branchName);
+    const cleanupErrors = [];
+    try {
+      await safeRemoveWorktree(record.repositoryRoot, record.workspacePath);
+    } catch (error) {
+      cleanupErrors.push(`worktree: ${error.message}`);
+    }
+    try {
+      await safeDeleteBranch(record.repositoryRoot, record.branchName);
+    } catch (error) {
+      cleanupErrors.push(`branch: ${error.message}`);
+    }
+
+    if (cleanupErrors.length) {
+      record.reconcileStatus = "cleanup-failed";
+      reconciliations.set(record.sessionID, record);
+      await persistTaskState();
+      return [
+        `✗ Failed to fully clean up isolated worktree for ${record.title}.`,
+        ...cleanupErrors,
+      ].join("\n");
+    }
 
     record.reconcileStatus = "cleaned";
     record.cleanedAt = Date.now();
     record.workspaceRemoved = true;
     reconciliations.set(record.sessionID, record);
+    removeTaskMappingsForSession(record.sessionID);
+    removeDelegationStateForSession(record.sessionID);
+    await persistTaskState();
 
     return [
       `✓ Cleaned up isolated worktree for ${record.title}.`,
@@ -742,28 +1064,30 @@ export default async (ctx) => {
 
   async function queueCompletion(tracked, childSessionID) {
     if (tracked.completionQueued) return;
+    if (pendingQuestionRelaysBySession.has(childSessionID)) return;
     tracked.completionQueued = true;
 
-    const { data: messages } = await client.session.messages({ path: { id: childSessionID }, query: { limit: 50 } });
-    const result = extractFinalResult(messages);
+    const result = await getCompletionResultWithRetry(childSessionID);
     if (!result) {
+      const artifacts = await collectCompletionArtifacts(tracked);
       tracked.completionQueued = false;
+      await markTaskNeedsAttention(tracked, childSessionID, "Session went idle but no final result was persisted before retry timeout.", artifacts);
       return;
     }
 
-    tracked.status = "completed";
     const artifacts = await collectCompletionArtifacts(tracked);
+    if (artifacts.reconcileStatus === "needs-attention" || artifacts.reconcileStatus === "verification-failed") {
+      tracked.completionQueued = false;
+      await markTaskNeedsAttention(tracked, childSessionID, "Task completed with unverifiable artifacts. Review patch/worktree manually.", artifacts);
+      return;
+    }
+
     const reconciliationRecord = {
       ...tracked,
       ...artifacts,
       sessionID: childSessionID,
       completedAt: Date.now(),
     };
-
-    trackedSessions.delete(childSessionID);
-    if (reconciliationRecord.effectiveMode === "isolated") {
-      reconciliations.set(childSessionID, reconciliationRecord);
-    }
 
     const header = result.errorMessage ? "✗ Background Task Failed" : "✓ Background Task Completed";
     const footer = [];
@@ -773,6 +1097,8 @@ export default async (ctx) => {
     if (tracked.claimedTargets?.length) footer.push(`Targets: ${tracked.claimedTargets.join(", ")}`);
     if (tracked.workspacePath) footer.push(`Worktree: ${tracked.workspacePath}`);
     if (artifacts.changedFiles?.length) footer.push(`Changed files: ${artifacts.changedFiles.join(", ")}`);
+    if (artifacts.verificationStatus) footer.push(`Verification: ${artifacts.verificationStatus}`);
+    if (artifacts.reconcileStatus) footer.push(`Reconcile status: ${artifacts.reconcileStatus}`);
     if (artifacts.patchPath) {
       footer.push(`Patch: ${artifacts.patchPath}`);
       footer.push(`Reconcile: bg_task_reconcile(task_id: "${childSessionID}", action: "status" | "apply" | "cleanup")`);
@@ -798,6 +1124,14 @@ export default async (ctx) => {
         system: "This is an asynchronous background task completion notice from the task plugin. Use the completed result below as fresh context for the existing conversation and continue naturally without changing the current session behavior.",
       },
     });
+
+    tracked.status = "completed";
+    trackedSessions.delete(childSessionID);
+    removeDelegationStateForSession(childSessionID);
+    if (reconciliationRecord.effectiveMode === "isolated") {
+      reconciliations.set(childSessionID, reconciliationRecord);
+    }
+    await persistTaskState();
   }
 
   return {
@@ -905,11 +1239,13 @@ export default async (ctx) => {
 
             let workspacePath = existingState?.workspacePath;
             let branchName = existingState?.branchName;
+            let baseRef = existingState?.baseRef;
 
             if (!workspacePath && effectiveMode === "isolated") {
               createdWorkspace = await createIsolatedWorkspace(repositoryRoot);
               workspacePath = createdWorkspace.workspacePath;
               branchName = createdWorkspace.branchName;
+              baseRef = createdWorkspace.baseRef;
             }
 
             let session;
@@ -945,15 +1281,18 @@ export default async (ctx) => {
               repositoryRoot,
               workspacePath,
               branchName,
+              baseRef,
               status: "active",
               conflicts: conflicts.map((item) => ({ sessionID: item.sessionID, title: item.title })),
             };
 
-            delegatedSessionParents.set(session.id, parentSessionID);
-            trackedSessions.set(session.id, tracked);
-            if (task_id) {
-              taskIdToSessionId.set(task_id, session.id);
-            }
+            await withPersistedState(async () => {
+              delegatedSessionParents.set(session.id, parentSessionID);
+              trackedSessions.set(session.id, tracked);
+              if (task_id) {
+                taskIdToSessionId.set(task_id, session.id);
+              }
+            });
 
             await client.session.promptAsync({
               path: { id: session.id },
@@ -989,7 +1328,17 @@ export default async (ctx) => {
             });
           } catch (error) {
             if (createdWorkspace) {
-              await safeRemoveWorktree(await getRepositoryRoot(), createdWorkspace.workspacePath);
+              const repoRoot = await getRepositoryRoot();
+              try {
+                await safeRemoveWorktree(repoRoot, createdWorkspace.workspacePath);
+              } catch (cleanupError) {
+                await logApp("warn", "Failed to remove worktree after delegation error", { error: cleanupError.message, workspacePath: createdWorkspace.workspacePath });
+              }
+              try {
+                await safeDeleteBranch(repoRoot, createdWorkspace.branchName);
+              } catch (cleanupError) {
+                await logApp("warn", "Failed to delete branch after delegation error", { error: cleanupError.message, branchName: createdWorkspace.branchName });
+              }
             }
             return `✗ Failed to delegate task: ${error.message}`;
           }
@@ -1055,6 +1404,15 @@ export default async (ctx) => {
             return `✗ Task ${task_id} has no recorded patch to apply.`;
           }
 
+          try {
+            const patchStat = await fs.stat(record.patchPath);
+            if (!patchStat.size) {
+              return `✗ Task ${task_id} patch artifact is empty.`;
+            }
+          } catch (error) {
+            return `✗ Task ${task_id} patch artifact is unavailable: ${error.message}`;
+          }
+
           if (record.reconcileStatus === "applied") {
             return `✓ Patch for task ${task_id} has already been applied.`;
           }
@@ -1077,6 +1435,7 @@ export default async (ctx) => {
             record.reconcileStatus = "applied";
             record.reconciledAt = Date.now();
             reconciliations.set(resolvedId, record);
+            await persistTaskState();
             return [
               `✓ Applied isolated task patch for ${record.title}.`,
               `Patch: ${record.patchPath}`,
@@ -1118,7 +1477,7 @@ export default async (ctx) => {
 
             if (action === "reject") {
               await client.question.reject({ requestID: relay.requestID });
-              pendingQuestionRelays.delete(relay.requestID);
+              deletePendingQuestionRelay(relay);
               return [
                 `✓ Rejected background-task question for ${relay.title}.`,
                 `Child session: opencode://session/${relay.childSessionID}`,
@@ -1139,7 +1498,7 @@ export default async (ctx) => {
               requestID: relay.requestID,
               answers: normalizedAnswers,
             });
-            pendingQuestionRelays.delete(relay.requestID);
+            deletePendingQuestionRelay(relay);
 
             return [
               `✓ Sent answers to background task ${relay.title}.`,
@@ -1182,6 +1541,7 @@ export default async (ctx) => {
         if (text.length > 50 && !assessedMessages.has(msgId)) {
           // We mark it as assessed immediately to avoid multiple triggers during streaming
           assessedMessages.add(msgId);
+          pruneAssessedMessages();
           
           // Fire and forget the assessment
           (async () => {
@@ -1252,6 +1612,7 @@ Please use the bg_task or bg_task_start_batch tools to execute this strategy bef
       const childSessionID = event.properties?.sessionID;
 
       if (event.type === "question.asked") {
+        purgeStaleQuestionRelays();
         const childQuestionSessionID = event.properties?.sessionID;
         const parentSessionID = childQuestionSessionID
           ? trackedSessions.get(childQuestionSessionID)?.parentSessionID || delegatedSessionParents.get(childQuestionSessionID)
@@ -1260,9 +1621,9 @@ Please use the bg_task or bg_task_start_batch tools to execute this strategy bef
 
         if (childQuestionSessionID && parentSessionID && tracked) {
           const relay = {
-            requestID: event.properties.id,
-            childSessionID: childQuestionSessionID,
-            parentSessionID,
+              requestID: event.properties.requestID,
+              childSessionID: childQuestionSessionID,
+              parentSessionID,
             title: tracked.title,
             questions: event.properties.questions,
             parentAgent: tracked.parentAgent,
@@ -1272,11 +1633,28 @@ Please use the bg_task or bg_task_start_batch tools to execute this strategy bef
             createdAt: Date.now(),
           };
 
-          pendingQuestionRelays.set(relay.requestID, relay);
+          if (!relay.requestID) {
+            try {
+              await client.app.log({
+                body: {
+                  service: "bg_task",
+                  level: "warn",
+                  message: "Delegated session question missing requestID",
+                  extra: { childSessionID: childQuestionSessionID, eventProperties: event.properties },
+                },
+              });
+            } catch {}
+            return;
+          }
+
+          setPendingQuestionRelay(relay);
+          await persistTaskState();
 
           try {
             await notifyParentOfQuestion(relay);
           } catch (error) {
+            deletePendingQuestionRelay(relay);
+            await persistTaskState();
             try {
               await client.app.log({
                 body: {
@@ -1292,7 +1670,8 @@ Please use the bg_task or bg_task_start_batch tools to execute this strategy bef
       }
 
       if (event.type === "question.replied" || event.type === "question.rejected") {
-        pendingQuestionRelays.delete(event.properties?.requestID);
+        deletePendingQuestionRelay(event.properties?.requestID);
+        await persistTaskState();
       }
 
       if (childSessionID && isIdle) {
