@@ -143,6 +143,111 @@ export default async (ctx) => {
     }
   }
 
+  async function sweepStaleWorktrees() {
+    // Collect all session IDs currently referenced by live state
+    const liveSessionIds = new Set();
+    for (const [sessionID, tracked] of trackedSessions.entries()) {
+      if (tracked?.status === "active") liveSessionIds.add(sessionID);
+    }
+    for (const [sessionID, rec] of reconciliations.entries()) {
+      // Keep any reconciliation that is NOT already cleaned - user may still want to inspect/apply
+      if (rec?.reconcileStatus && rec.reconcileStatus !== "cleaned") liveSessionIds.add(sessionID);
+    }
+
+    // Build set of live workspacePaths from tracked + reconciliations
+    const liveWorkspacePaths = new Set();
+    for (const tracked of trackedSessions.values()) {
+      if (tracked?.workspacePath && liveSessionIds.has(tracked.sessionID || "")) {
+        liveWorkspacePaths.add(tracked.workspacePath);
+      }
+    }
+    for (const [sessionID, rec] of reconciliations.entries()) {
+      if (rec?.workspacePath && liveSessionIds.has(sessionID)) {
+        liveWorkspacePaths.add(rec.workspacePath);
+      }
+    }
+
+    // Read worktreesDirectory; for each task-* dir not in liveWorkspacePaths, attempt cleanup
+    let entries;
+    try {
+      entries = await fs.readdir(worktreesDirectory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        await logApp("warn", "Failed to read worktrees directory during sweep", { error: error.message, worktreesDirectory });
+      }
+      return;
+    }
+
+    let removed = 0;
+    let errors = 0;
+    const STALE_AGE_MS = 60 * 60 * 1000; // 1 hour grace period to avoid removing freshly-created worktrees mid-init
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (!entry.name.startsWith("task-")) continue;
+
+      const fullPath = path.join(worktreesDirectory, entry.name);
+      if (liveWorkspacePaths.has(fullPath)) continue;
+
+      // Grace period: skip if directory was modified within last hour (another session may own it)
+      try {
+        const stats = await fs.stat(fullPath);
+        if (Date.now() - stats.mtimeMs < STALE_AGE_MS) continue;
+      } catch {
+        continue; // gone already
+      }
+
+      // Find the parent repo from the .git pointer file inside the worktree
+      let parentRepo = null;
+      let branchName = null;
+      try {
+        const gitPointer = await fs.readFile(path.join(fullPath, ".git"), "utf8");
+        const match = gitPointer.match(/^gitdir:\s*(.+)$/m);
+        if (match) {
+          // gitdir path looks like: /path/to/repo/.git/worktrees/task-xxx
+          const gitdir = match[1].trim();
+          const wtName = path.basename(gitdir);
+          branchName = `opencode-${wtName}`;
+          // parent repo = dirname(dirname(dirname(gitdir))) since gitdir = <repo>/.git/worktrees/<name>
+          parentRepo = path.dirname(path.dirname(path.dirname(gitdir)));
+        }
+      } catch {}
+
+      // Try git worktree remove first (proper cleanup)
+      let removeOk = false;
+      if (parentRepo) {
+        try {
+          await runGit(parentRepo, ["worktree", "remove", "--force", fullPath]);
+          removeOk = true;
+        } catch (error) {
+          await logApp("warn", "git worktree remove failed during sweep", { error: error.message, fullPath, parentRepo });
+        }
+        // Prune stale refs in case the dir was already gone
+        try { await runGit(parentRepo, ["worktree", "prune"]); } catch {}
+        // Delete the branch if it exists
+        if (branchName) {
+          try { await runGit(parentRepo, ["branch", "-D", branchName]); } catch {}
+        }
+      }
+
+      // Fallback: if git cleanup didn't work, rm -rf the directory
+      if (!removeOk) {
+        try {
+          await fs.rm(fullPath, { recursive: true, force: true });
+        } catch (error) {
+          errors += 1;
+          await logApp("warn", "Failed to rm stale worktree directory", { error: error.message, fullPath });
+          continue;
+        }
+      }
+      removed += 1;
+    }
+
+    if (removed > 0 || errors > 0) {
+      await logApp("info", "Swept stale worktrees on startup", { removed, errors, worktreesDirectory });
+    }
+  }
+
   async function withPersistedState(mutator) {
     const result = await mutator();
     await persistTaskState();
@@ -163,6 +268,7 @@ export default async (ctx) => {
   }
 
   await loadPersistedTaskState();
+  await sweepStaleWorktrees();
 
   function normalizeAgentKey(value = "") {
     return value

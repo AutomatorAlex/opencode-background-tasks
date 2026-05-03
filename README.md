@@ -288,6 +288,16 @@ When a task declares targets like `["src/auth/**", "src/middleware.ts"]`, the pl
 4. **Reconcile** — Parent session applies the patch via `git apply --3way`
 5. **Cleanup** — Worktree and branch removed, patch retained for audit
 
+### Automatic cleanup on startup
+
+Stale worktrees are swept each time the plugin loads:
+
+- A worktree is **stale** if it is not referenced by an active tracked session or a pending reconciliation record
+- Worktrees modified within the last hour are preserved (grace period to protect freshly-created ones)
+- Stale worktrees are removed via `git worktree remove --force` and the associated `opencode-task-*` branch is deleted
+- If the git cleanup fails, the directory is removed with `rm -rf` as a fallback
+- Sweep results are logged via the OpenCode app log
+
 ## Requirements
 
 - [OpenCode](https://github.com/anomalyco/opencode) with plugin support
