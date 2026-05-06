@@ -554,12 +554,18 @@ export default async (ctx) => {
 
   const agentCatalog = await loadAgentCatalog();
 
-  let opencodeConfig = {};
-  try {
-    const rawConfig = await fs.readFile(path.join(homeDirectory, ".config", "opencode", "opencode.json"), "utf8");
-    opencodeConfig = JSON.parse(rawConfig);
-  } catch (e) {
-    console.error("[task] Failed to read opencode.json for MOE assessment:", e.message);
+  let moeAssessmentModel = null;
+
+  async function getMoeAssessmentModel() {
+    if (moeAssessmentModel) return moeAssessmentModel;
+    try {
+      const rawConfig = await fs.readFile(path.join(homeDirectory, ".config", "opencode", "opencode.json"), "utf8");
+      const config = JSON.parse(rawConfig);
+      moeAssessmentModel = config.small_model || null;
+    } catch (e) {
+      // silently fall back to default — JSON parsing errors are not actionable for this plugin
+    }
+    return moeAssessmentModel;
   }
 
 
@@ -1652,7 +1658,8 @@ export default async (ctx) => {
           // Fire and forget the assessment
           (async () => {
             try {
-              const model = opencodeConfig.small_model || "openrouter/google/gemini-3-flash-preview";
+              const configuredModel = await getMoeAssessmentModel();
+              const model = configuredModel || "openrouter/google/gemini-3-flash-preview";
               const prompt = `Analyze this user request and determine if it should be delegated to specialized agents using the Mixture of Experts (MoE) pattern.
 The primary agent has access to a 'bg_task' tool that can launch background subagents.
 
