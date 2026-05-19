@@ -267,6 +267,100 @@ export default async (ctx) => {
     } catch {}
   }
 
+  async function loadOpenCodePermissionConfig() {
+    try {
+      const rawConfig = await fs.readFile(path.join(homeDirectory, ".config", "opencode", "opencode.json"), "utf8");
+      const config = JSON.parse(rawConfig);
+      return config.permission;
+    } catch (error) {
+      await logApp("warn", "Failed to load OpenCode permission config for background task auto-approval", { error: error.message });
+      return undefined;
+    }
+  }
+
+  function permissionPatternToRegExp(pattern) {
+    let result = "^";
+    for (const char of String(pattern)) {
+      if (char === "*") {
+        result += ".*";
+        continue;
+      }
+      if (char === "?") {
+        result += ".";
+        continue;
+      }
+      result += escapeRegExp(char);
+    }
+    result += "$";
+    return new RegExp(result);
+  }
+
+  function permissionPatternMatches(rulePattern, requestedPattern) {
+    const rule = String(rulePattern || "");
+    const requested = String(requestedPattern || "");
+    return permissionPatternToRegExp(rule).test(requested) || permissionPatternToRegExp(requested).test(rule);
+  }
+
+  function resolvePermissionAction(permissionConfig, permissionType, requestedPatterns = []) {
+    if (!permissionConfig) return undefined;
+    if (typeof permissionConfig === "string") return permissionConfig;
+    if (typeof permissionConfig !== "object") return undefined;
+
+    const patterns = Array.isArray(requestedPatterns) ? requestedPatterns : [requestedPatterns];
+    let action = typeof permissionConfig["*"] === "string" ? permissionConfig["*"] : undefined;
+    const typeConfig = permissionConfig[permissionType];
+
+    if (typeof typeConfig === "string") return typeConfig;
+    if (!typeConfig || typeof typeConfig !== "object") return action;
+
+    for (const [rulePattern, ruleAction] of Object.entries(typeConfig)) {
+      if (!patterns.length || patterns.some((pattern) => permissionPatternMatches(rulePattern, pattern))) {
+        action = ruleAction;
+      }
+    }
+
+    return action;
+  }
+
+  async function maybeAutoReplyToChildPermission(event) {
+    const permission = event?.properties;
+    const childSessionID = permission?.sessionID;
+    if (!childSessionID || !permission?.id || !trackedSessions.has(childSessionID)) return false;
+
+    const permissionConfig = await loadOpenCodePermissionConfig();
+    const requestedPatterns = permission.pattern === undefined
+      ? []
+      : Array.isArray(permission.pattern) ? permission.pattern : [permission.pattern];
+    const action = resolvePermissionAction(permissionConfig, permission.type, requestedPatterns);
+
+    if (action !== "allow" && action !== "deny") return false;
+
+    try {
+      await client.postSessionIdPermissionsPermissionId({
+        path: { id: childSessionID, permissionID: permission.id },
+        body: { response: action === "allow" ? "always" : "reject" },
+      });
+      await logApp("info", "Auto-replied to delegated session permission request", {
+        childSessionID,
+        permissionID: permission.id,
+        permissionType: permission.type,
+        patterns: requestedPatterns,
+        action,
+      });
+      return true;
+    } catch (error) {
+      await logApp("error", "Failed to auto-reply to delegated session permission request", {
+        childSessionID,
+        permissionID: permission.id,
+        permissionType: permission.type,
+        patterns: requestedPatterns,
+        action,
+        error: error.message,
+      });
+      return false;
+    }
+  }
+
   await loadPersistedTaskState();
   await sweepStaleWorktrees();
 
@@ -588,7 +682,7 @@ export default async (ctx) => {
       "- Choose the most specialized agent whose primary mission matches the requested deliverable.",
       "- Base the choice on the main output needed (tests, docs, planning, research, exploration, implementation, frontend, infrastructure, database work, etc.), not just on whether the task broadly involves code.",
       "- Prefer a specialist over a generalist when one agent is clearly a closer semantic match.",
-      "- Use build as the fallback for mixed or ambiguous coding work, not as the default for every technical task.",
+      "- Use staff-engineer as the fallback for mixed or ambiguous coding work, not as the default for every technical task.",
       "",
       "Concurrency & workspace policy:",
       "- For editing tasks, provide targets whenever possible so the task system can detect overlapping file claims.",
@@ -1128,7 +1222,7 @@ export default async (ctx) => {
       return "✗ Task has no recorded isolated worktree to clean up.";
     }
 
-    if (!["applied", "no-changes", "external-only", "cleaned"].includes(record.reconcileStatus || "")) {
+    if (!["applied", "no-changes", "external-only", "cleaned", "cancelled", "failed"].includes(record.reconcileStatus || "")) {
       return `✗ Refusing cleanup for ${record.title} because reconcile status is ${record.reconcileStatus || "pending"}. Apply or inspect it first.`;
     }
 
@@ -1457,10 +1551,13 @@ export default async (ctx) => {
         },
       }),
       bg_task_list: tool({
-        description: "List all active background tasks and any completed isolated tasks waiting for reconciliation.",
-        args: {},
-        async execute() {
-          const active = Array.from(trackedSessions.values()).map((data) => {
+        description: "List background tasks for the current parent session. Set all=true to include tasks across all sessions.",
+        args: {
+          all: tool.schema.boolean().optional().describe("Set true to list tasks across all parent sessions instead of only the current session."),
+        },
+        async execute({ all = false }, context) {
+          const isVisible = (data) => all || !context.sessionID || data.parentSessionID === context.sessionID;
+          const active = Array.from(trackedSessions.values()).filter(isVisible).map((data) => {
             return [
               `• ${data.title}`,
               `  session: opencode://session/${data.sessionID}`,
@@ -1470,7 +1567,7 @@ export default async (ctx) => {
             ].join("\n");
           });
 
-          const pending = Array.from(reconciliations.values()).map((data) => {
+          const pending = Array.from(reconciliations.values()).filter(isVisible).map((data) => {
             return [
               `• ${data.title}`,
               `  session: opencode://session/${data.sessionID}`,
@@ -1481,7 +1578,9 @@ export default async (ctx) => {
             ].join("\n");
           });
 
-          if (!active.length && !pending.length) return "No active background tasks.";
+          if (!active.length && !pending.length) {
+            return all || !context.sessionID ? "No active background tasks." : "No active background tasks for this session.";
+          }
 
           return [
             active.length ? `Active background tasks\n${active.join("\n")}` : undefined,
@@ -1556,6 +1655,116 @@ export default async (ctx) => {
           } catch (error) {
             return `✗ Failed to apply task patch: ${error.message}`;
           }
+        },
+      }),
+      bg_task_stop: tool({
+        description: "Stop/abort an active background task.",
+        args: {
+          task_id: tool.schema.string().describe("The task session ID or logical task ID to stop/abort."),
+        },
+        async execute({ task_id }) {
+          const resolvedId = taskIdToSessionId.get(task_id) || task_id;
+          const tracked = trackedSessions.get(resolvedId);
+          if (!tracked) {
+            if (reconciliations.has(resolvedId)) {
+              return `✗ Task ${task_id} is not active (status: ${reconciliations.get(resolvedId).status || "completed"}).`;
+            }
+            return `✗ Unknown or inactive task_id: ${task_id} (resolved: ${resolvedId})`;
+          }
+
+          try {
+            await client.session.abort({ path: { id: resolvedId } });
+          } catch (error) {
+            await logApp("warn", "client.session.abort failed", { error: error.message, resolvedId });
+          }
+
+          tracked.status = "cancelled";
+          tracked.reconcileStatus = "cancelled";
+          tracked.completedAt = Date.now();
+          
+          trackedSessions.delete(resolvedId);
+          removeDelegationStateForSession(resolvedId);
+          
+          const relay = Array.from(pendingQuestionRelays.values()).find((r) => r.childSessionID === resolvedId);
+          if (relay) {
+            deletePendingQuestionRelay(relay);
+          }
+
+          reconciliations.set(resolvedId, tracked);
+          await persistTaskState();
+
+          return `✓ Successfully stopped/aborted background task: ${tracked.title} (${resolvedId})`;
+        },
+      }),
+      bg_task_delete: tool({
+        description: "Delete an ongoing active or completed background task. This stops the task (if active), deletes the session from OpenCode, cleans up any isolated worktrees, and removes its tracked state.",
+        args: {
+          task_id: tool.schema.string().describe("The task session ID or logical task ID to delete."),
+          force: tool.schema.boolean().optional().describe("Force state removal even if isolated worktree cleanup fails (default: false)."),
+        },
+        async execute({ task_id, force = false }) {
+          const resolvedId = taskIdToSessionId.get(task_id) || task_id;
+          const record = trackedSessions.get(resolvedId) || reconciliations.get(resolvedId);
+          if (!record) {
+            return `✗ Unknown task_id: ${task_id} (resolved: ${resolvedId})`;
+          }
+
+          const isActive = trackedSessions.has(resolvedId);
+
+          if (isActive) {
+            try {
+              await client.session.abort({ path: { id: resolvedId } });
+            } catch (error) {
+              await logApp("warn", "client.session.abort failed during delete", { error: error.message, resolvedId });
+            }
+          }
+
+          let cleanupResult = "";
+          if (record.effectiveMode === "isolated" && record.workspacePath && record.reconcileStatus !== "cleaned") {
+            const originalReconcileStatus = record.reconcileStatus;
+            if (isActive) {
+              record.reconcileStatus = "cancelled";
+            } else if (!["applied", "no-changes", "external-only", "cleaned", "cancelled", "failed"].includes(record.reconcileStatus || "")) {
+              record.reconcileStatus = "cancelled";
+            }
+            
+            cleanupResult = await cleanupReconciliation(record);
+            if (cleanupResult.startsWith("✗") && !force) {
+              record.reconcileStatus = originalReconcileStatus;
+              return `✗ Failed to delete because isolated worktree cleanup failed. Use force: true to bypass. Error:\n${cleanupResult}`;
+            }
+          }
+
+          try {
+            await client.session.delete({ path: { id: resolvedId } });
+          } catch (error) {
+            await logApp("warn", "client.session.delete failed during delete", { error: error.message, resolvedId });
+          }
+
+          if (record.patchPath) {
+            try {
+              await fs.rm(record.patchPath, { force: true });
+            } catch (error) {
+              await logApp("warn", "Failed to delete patch file during task delete", { error: error.message, path: record.patchPath });
+            }
+          }
+
+          const relay = Array.from(pendingQuestionRelays.values()).find((r) => r.childSessionID === resolvedId);
+          if (relay) {
+            deletePendingQuestionRelay(relay);
+          }
+
+          trackedSessions.delete(resolvedId);
+          reconciliations.delete(resolvedId);
+          removeTaskMappingsForSession(resolvedId);
+          removeDelegationStateForSession(resolvedId);
+          
+          await persistTaskState();
+
+          return [
+            `✓ Successfully deleted task: ${record.title} (${resolvedId})`,
+            cleanupResult ? `Cleanup: ${cleanupResult}` : undefined,
+          ].filter(Boolean).join("\n");
         },
       }),
       bg_task_question_list: tool({
@@ -1723,6 +1932,10 @@ Please use the bg_task or bg_task_start_batch tools to execute this strategy bef
       }
 
       const childSessionID = event.properties?.sessionID;
+
+      if (event.type === "permission.updated") {
+        await maybeAutoReplyToChildPermission(event);
+      }
 
       if (event.type === "question.asked") {
         purgeStaleQuestionRelays();
