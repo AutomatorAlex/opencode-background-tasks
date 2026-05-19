@@ -361,7 +361,46 @@ export default async (ctx) => {
     }
   }
 
+  async function reconcileStaleSessions() {
+    const activeTasks = Array.from(trackedSessions.entries()).filter(([, tracked]) => tracked.status === "active");
+    if (!activeTasks.length) return;
+
+    await logApp("info", "Checking active background tasks status on startup...", { count: activeTasks.length });
+
+    let statusMap = {};
+    try {
+      const statusResult = await client.session.status();
+      statusMap = unwrapSessionRecord(statusResult) || {};
+    } catch (error) {
+      await logApp("warn", "Failed to retrieve sessions status map on startup", { error: error.message });
+    }
+
+    for (const [sessionID, tracked] of activeTasks) {
+      try {
+        const { data: messages } = await client.session.messages({ path: { id: sessionID }, query: { limit: 100 } });
+        const result = extractFinalResult(messages);
+        
+        if (result) {
+          await logApp("info", `Background task completed while offline: ${tracked.title}`, { sessionID });
+          await queueCompletion(tracked, sessionID);
+        } else {
+          const sessionStatus = statusMap[sessionID];
+          if (!sessionStatus || sessionStatus.type === "idle") {
+            await logApp("info", `Reconciling stale/idle background task: ${tracked.title}`, { sessionID, sessionStatus });
+            const artifacts = await collectCompletionArtifacts(tracked);
+            await markTaskNeedsAttention(tracked, sessionID, "Task session went idle or became unavailable without producing final result.", artifacts);
+          }
+        }
+      } catch (error) {
+        await logApp("warn", `Failed to retrieve session messages for task: ${tracked.title}`, { sessionID, error: error.message });
+        const artifacts = await collectCompletionArtifacts(tracked);
+        await markTaskNeedsAttention(tracked, sessionID, `Task session is unavailable: ${error.message}`, artifacts);
+      }
+    }
+  }
+
   await loadPersistedTaskState();
+  await reconcileStaleSessions();
   await sweepStaleWorktrees();
 
   function normalizeAgentKey(value = "") {
