@@ -248,6 +248,26 @@ export default async (ctx) => {
     }
   }
 
+  async function purgeStaleReconciliations() {
+    const STALE_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+    let purged = 0;
+    for (const [sessionID, rec] of reconciliations.entries()) {
+      const completedAt = rec.completedAt || rec.cleanedAt || rec.reconciledAt || Date.now();
+      if (Date.now() - completedAt > STALE_AGE_MS) {
+        if (["cleaned", "no-changes", "external-only", "cancelled"].includes(rec.reconcileStatus)) {
+          reconciliations.delete(sessionID);
+          removeTaskMappingsForSession(sessionID);
+          removeDelegationStateForSession(sessionID);
+          purged += 1;
+        }
+      }
+    }
+    if (purged > 0) {
+      await persistTaskState();
+      await logApp("info", "Auto-purged stale reconciliations", { purged });
+    }
+  }
+
   async function withPersistedState(mutator) {
     const result = await mutator();
     await persistTaskState();
@@ -399,9 +419,32 @@ export default async (ctx) => {
     }
   }
 
+  async function ensureServerReady(maxRetries = 10, delayMs = 500) {
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        await client.session.status();
+        return true;
+      } catch (error) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+    return false;
+  }
+
   await loadPersistedTaskState();
-  await reconcileStaleSessions();
-  await sweepStaleWorktrees();
+  setTimeout(async () => {
+    try {
+      const ready = await ensureServerReady();
+      if (!ready) {
+        await logApp("warn", "OpenCode server did not become ready in time for background task reconciliation");
+      }
+      await reconcileStaleSessions();
+      await sweepStaleWorktrees();
+      await purgeStaleReconciliations();
+    } catch (err) {
+      await logApp("error", "Background task startup actions failed", { error: err.message, stack: err.stack });
+    }
+  }, 100);
 
   function normalizeAgentKey(value = "") {
     return value
@@ -1024,6 +1067,7 @@ export default async (ctx) => {
     const lines = [
       `Task: ${record.title}`,
       `Session: opencode://session/${record.sessionID}`,
+      `Agent: ${record.agent || "unknown"}`,
       `Mode: ${record.effectiveMode}`,
       `Targets: ${describeTargets(record.claimedTargets)}`,
     ];
@@ -1161,6 +1205,7 @@ export default async (ctx) => {
           text: [
             `⚠ Background Task Needs Attention: ${tracked.title}`,
             `Session: opencode://session/${childSessionID}`,
+            `Agent: ${tracked.agent || "unknown"}`,
             "────────────────────",
             reason,
             artifacts.verificationStatus ? `Verification: ${artifacts.verificationStatus}` : undefined,
@@ -1352,6 +1397,7 @@ export default async (ctx) => {
     const text = [
       `${header}: ${tracked.title}`,
       `Session: opencode://session/${childSessionID}`,
+      `Agent: ${tracked.agent || "unknown"}`,
       "────────────────────",
       result.errorMessage ? result.errorMessage : result.text,
       footer.length ? "" : undefined,
@@ -1515,6 +1561,7 @@ export default async (ctx) => {
               sessionID: session.id,
               parentSessionID,
               title,
+              agent: selectedAgent,
               parentAgent: parentContinuation.agent,
               parentModel: parentContinuation.model,
               parentVariant: parentContinuation.variant,
@@ -1565,6 +1612,7 @@ export default async (ctx) => {
               output: [
                 `✓ Task delegated and running in background.`,
                 `Track it here: opencode://session/${session.id}`,
+                `Agent: ${selectedAgent}`,
                 `Mode: ${effectiveMode}`,
                 `Targets (${targetSource}): ${describeTargets(claimedTargets)}`,
                 ...(workspacePath ? [`Worktree: ${workspacePath}`] : []),
@@ -1590,26 +1638,34 @@ export default async (ctx) => {
         },
       }),
       bg_task_list: tool({
-        description: "List background tasks for the current parent session. Set all=true to include tasks across all sessions.",
+        description: "List background tasks for the current parent session. Set all=true to include tasks across all sessions. Defaults to 5 most recent active + 5 most recent pending. Set limit=0 for unlimited. IMPORTANT: Do NOT poll this tool repeatedly to check for task completion. Task results are automatically delivered to the chat asynchronously when they finish. Only use this tool if the user explicitly asks for status or if you are genuinely blocked.",
         args: {
           all: tool.schema.boolean().optional().describe("Set true to list tasks across all parent sessions instead of only the current session."),
+          limit: tool.schema.number().optional().describe("Max tasks per category (active/pending) to return. Default 5. Set 0 or -1 for unlimited."),
         },
-        async execute({ all = false }, context) {
+        async execute({ all = false, limit = 5 }, context) {
+          const effectiveLimit = (limit === undefined || limit === null) ? 5 : (limit <= 0 ? Infinity : limit);
           const isVisible = (data) => all || !context.sessionID || data.parentSessionID === context.sessionID;
-          const active = Array.from(trackedSessions.values()).filter(isVisible).map((data) => {
+
+          const activeEntries = Array.from(trackedSessions.values()).filter(isVisible);
+          // Most recent first: reverse Map insertion order
+          const active = activeEntries.reverse().slice(0, effectiveLimit).map((data) => {
             return [
               `• ${data.title}`,
               `  session: opencode://session/${data.sessionID}`,
+              `  agent: ${data.agent || "unknown"}`,
               `  mode: ${data.effectiveMode}`,
               `  targets (${data.targetSource || "none"}): ${describeTargets(data.claimedTargets)}`,
               ...(data.workspacePath ? [`  worktree: ${data.workspacePath}`] : []),
             ].join("\n");
           });
 
-          const pending = Array.from(reconciliations.values()).filter(isVisible).map((data) => {
+          const pendingEntries = Array.from(reconciliations.values()).filter(isVisible);
+          const pending = pendingEntries.reverse().slice(0, effectiveLimit).map((data) => {
             return [
               `• ${data.title}`,
               `  session: opencode://session/${data.sessionID}`,
+              `  agent: ${data.agent || "unknown"}`,
               `  reconcile: ${data.reconcileStatus || "pending"}`,
               `  targets (${data.targetSource || "none"}): ${describeTargets(data.claimedTargets)}`,
               ...(data.patchPath ? [`  patch: ${data.patchPath}`] : []),
@@ -1617,13 +1673,21 @@ export default async (ctx) => {
             ].join("\n");
           });
 
-          if (!active.length && !pending.length) {
+          if (!activeEntries.length && !pendingEntries.length) {
             return all || !context.sessionID ? "No active background tasks." : "No active background tasks for this session.";
           }
 
+          const summary = [];
+          if (activeEntries.length > 0) {
+            summary.push(`Active background tasks${activeEntries.length > effectiveLimit ? ` (showing ${active.length} of ${activeEntries.length})` : ""}`);
+          }
+          if (pendingEntries.length > 0) {
+            summary.push(`Pending reconciliation${pendingEntries.length > effectiveLimit ? ` (showing ${pending.length} of ${pendingEntries.length})` : ""}`);
+          }
+
           return [
-            active.length ? `Active background tasks\n${active.join("\n")}` : undefined,
-            pending.length ? `Pending reconciliation\n${pending.join("\n")}` : undefined,
+            active.length ? `${summary[0] || "Active background tasks"}\n${active.join("\n")}` : undefined,
+            pending.length ? `${summary[1] || "Pending reconciliation"}\n${pending.join("\n")}` : undefined,
           ].filter(Boolean).join("\n\n");
         },
       }),
